@@ -1,0 +1,253 @@
+#!/bin/bash
+# Lightweight script to set up SPITZ12 on ARCHER
+ 
+display_usage() { 
+   echo
+   echo "  Auto-Config: SPITZ on ARCHER"
+   echo "  ***************************************"
+   echo
+   echo "  usage: ${0##*/} -w path_to_install_nemo -x path_to_intall_xios "
+   echo
+   echo "  flags:  -w full path to where nemo will be installed"
+   echo "          -x full path to where xios will be installed"
+   echo
+   exit 1
+	} 
+# if less than three arguments supplied, display usage 
+	if [  $# -le 3 ] 
+	then 
+		display_usage
+		exit 1
+	fi 
+# if less than two arguments supplied, display usage 
+	if [  $# -ge 5 ] 
+	then 
+		display_usage
+		exit 1
+	fi 
+# check whether user had supplied -h or --help . If yes display usage 
+	if [[ ( $# == "--help") ||  $# == "-h" ]] 
+	then 
+		display_usage
+		exit 0
+	fi 
+
+while getopts w:x: option
+  do
+  case "${option}"
+  in
+  w) export WORK_DIR=${OPTARG};;
+  x) export XIOS_DIR=${OPTARG};;
+  esac
+done
+
+if [ ${WORK_DIR:0:1} != "/" ]; then
+  echo "WORK_DIR must use full path"
+  exit 1
+fi
+
+if [ ${XIOS_DIR:0:1} != "/" ]; then
+  echo "XIOS_DIR must use full path"
+  exit 1
+fi
+
+# Change to some working directory of choice
+if [ ! -d "$WORK_DIR" ]; then
+  mkdir $WORK_DIR
+fi
+cd $WORK_DIR
+
+echo "Making sure that the correct modules are loaded"
+
+module swap PrgEnv-cray PrgEnv-intel
+module load cray-hdf5-parallel
+module load cray-netcdf-hdf5parallel
+
+# Checkout the NEMO code from the SVN Paris repository 
+echo "Checking out NEMO repository"
+svn co http://forge.ipsl.jussieu.fr/nemo/svn/NEMO/releases/r4.0/r4.0.2 nemo
+mkdir nemo/arch
+
+echo $XIOS_DIR
+# Choose an appropriate directory for your XIOS installation
+if [ ! -d "$XIOS_DIR" ]; then
+  mkdir $XIOS_DIR
+fi
+cd $XIOS_DIR
+echo $PWD
+echo "Checking out xios repository"
+svn co http://forge.ipsl.jussieu.fr/ioserver/svn/XIOS/branchs/xios-2.5@1627 xios
+cd xios
+
+# Let's create the arch file to compile XIOS
+
+cat <<EOT >> ./arch/arch-archer.path
+%CFLAGS              -O0
+::::::::::::::
+arch-archer.path
+::::::::::::::
+NETCDF_INCDIR="-I \$NETCDF_INC_DIR"
+NETCDF_LIBDIR='-Wl,"--allow-multiple-definition" -Wl,"-Bstatic" -L \$NETCDF_LIB_DIR'
+NETCDF_LIB="-lnetcdf -lnetcdff"
+
+MPI_INCDIR=""
+MPI_LIBDIR=""
+MPI_LIB=""
+
+#HDF5_INCDIR="-I \$HDF5_INC_DIR"
+HDF5_LIBDIR="-L \$HDF5_LIB_DIR"
+HDF5_LIB="-lhdf5_hl -lhdf5 -lz"
+
+OASIS_INCDIR=""
+OASIS_LIBDIR=""
+OASIS_LIB=""
+EOT
+
+cat <<EOT >> ./arch/arch-archer.env
+export HDF5_INC_DIR=\${HDF5_DIR}/include
+export HDF5_LIB_DIR=\${HDF5_DIR}/lib
+export NETCDF_INC_DIR=\${NETCDF_DIR}/include
+export NETCDF_LIB_DIR=\${NETCDF_DIR}/lib
+EOT
+
+
+cat <<EOT >> ./arch/arch-archer.fcm
+%CCOMPILER           CC
+%FCOMPILER           ftn
+%LINKER              ftn -nofor-main -v
+
+%BASE_CFLAGS
+%PROD_CFLAGS    -O3 -D BOOST_DISABLE_ASSERTS
+%DEV_CFLAGS     -g -traceback
+%DEBUG_CFLAGS   -DBZ_DEBUG -g -traceback -fno-inline
+
+%BASE_FFLAGS    -D__NONE__
+%PROD_FFLAGS    -O2
+%DEV_FFLAGS     -g -O2 -traceback
+%DEBUG_FFLAGS   -g -traceback
+
+%BASE_INC       -D__NONE__
+%BASE_LD        -lstdc++
+
+%CPP            CC -EP
+%FPP            cpp -P
+%MAKE           gmake
+EOT
+
+echo "Compiling xios"
+./make_xios --full --prod --arch archer --netcdf_lib netcdf4_par --job 4
+
+# Let's update the path to xios
+export XIOS_DIR=$XIOS_DIR/xios
+
+cd $WORK_DIR/nemo
+
+# Let's create the arch file to compile NEMO
+
+cat <<EOT >> ./arch/arch-archer.fcm
+%NCDF_HOME           \$NETCDF_DIR
+%HDF5_HOME           \$HDF5_DIR
+%XIOS_HOME           \$XIOS_DIR
+
+%NCDF_INC            -I%NCDF_HOME/include -I%HDF5_HOME/include
+%NCDF_LIB            -L%HDF5_HOME/lib -L%NCDF_HOME/lib -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lz
+%XIOS_INC            -I%XIOS_HOME/inc 
+%XIOS_LIB            -L%XIOS_HOME/lib -lxios
+
+%CPP	             cpp
+%FC                  ftn
+%FCFLAGS             -integer-size 32 -real-size 64 -O3 -fp-model source -zero -fpp -warn all
+%FFLAGS              -integer-size 32 -real-size 64 -O3 -fp-model source -zero -fpp -warn all
+%LD                  CC -Wl,"--allow-multiple-definition"
+%FPPFLAGS            -P -C -traditional
+%LDFLAGS
+%AR                  ar 
+%ARFLAGS             -r
+%MK                  gmake
+%USER_INC            %XIOS_INC %NCDF_INC
+%USER_LIB            %XIOS_LIB %NCDF_LIB
+
+%CC                  cc
+%CFLAGS              -O0
+EOT
+
+
+cd $WORK_DIR/nemo
+
+echo "Compiling nemo SPITZ12 Config"
+./makenemo -m archer -r SPITZ12 -j 8
+
+cd $WORK_DIR/nemo/cfgs/SPITZ12/EXP00/
+
+# Create a runscipt
+
+cat <<EOT >> runscript.pbs
+#!/bin/bash
+# ---------------------------
+#===============================================================
+# CLUSTER BITS
+#===============================================================
+#PBS -N SPITZ12
+#PBS -l select=7
+#PBS -l walltime=00:20:00
+#PBS -A n01-CLASS
+#PBS -j oe
+#PBS -r n
+if [ -z \`echo \$LOADEDMODULES | grep PrgEnv-intel\` ]; then
+  current_PrgEnv=\`echo \$LOADEDMODULES | awk 'BEGIN{FS=OFS=":"} {for (i=1;i<=NF;i++) print $i}' | grep PrgEnv\`
+  module swap \$current_PrgEnv PrgEnv-intel
+fi
+
+if [ -z \`echo \$LOADEDMODULES | grep cray-netcdf-hdf5parallel\` ]; then
+  module load cray-netcdf-hdf5parallel
+fi
+
+if [ -z \`echo \$LOADEDMODULES | grep cray-hdf5-parallel\` ]; then
+  module load cray-hdf5-parallel
+fi
+
+# Change to the direcotry that the job was submitted from
+cd \$PBS_O_WORKDIR
+
+# Set the number of threads to 1
+#   This prevents any system libraries from automatically 
+#   using threading.
+export OMP_NUM_THREADS=1
+# Change to the directory that the job was submitted from
+ulimit -s unlimited
+
+export NEMOproc=143
+export XIOSproc=1
+
+#===============================================================
+# LAUNCH JOB
+#===============================================================
+echo `date` : Launch Job
+aprun -b -n \$NEMOproc -N 24 ./nemo : -N 1 -n \$XIOSproc ./xios_server.exe
+chmod a+r *
+exit
+EOT
+
+echo "Gathering forcing data"
+
+wget https://zenodo.org/record/3386310/files/SPITZ12_v4.0.tar
+tar xvf SPITZ12_v4.0.tar
+gunzip *.gz
+
+# Link in the XIOS server
+ln -s $XIOS_DIR/bin/xios_server.exe $WORK_DIR/nemo/cfgs/SPITZ12/EXP00/xios_server.exe
+
+# Ammend runscript
+sed -i 's/  experience name/  experience name\n   nn_date0    =  20020101/' namelist_cfg
+sed -i 's/   nn_itend    = 100/   nn_itend    = 3720/' namelist_cfg
+echo
+echo "  Auto-Config: SPITZ12"
+echo "  *****************************"
+echo
+echo "  To run the SPITZ12 Configuration:"
+echo
+echo "  - update the runscript.pbs accordingly "
+echo "      (project code, nodes, modules, etc)"
+echo
+echo "  - submit via the qsub command"
+echo    
